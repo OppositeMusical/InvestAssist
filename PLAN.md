@@ -1,373 +1,235 @@
 # InvestAssist — Implementation Plan
 
-An intraday buy/sell decision-support system for thinkorswim, built as a Python
-engine against the Schwab Trader API with a thinkScript mirror for on-chart
-confirmation.
-
-**Chosen configuration**
-
-| Decision | Choice |
-|---|---|
-| Horizon | Intraday (minutes–hours) |
-| Instruments | Stocks & ETFs, Options, Futures |
-| Automation | Recommend + one-click confirm |
-| Build target | Hybrid — Python engine + thinkScript mirror |
+A buy/sell decision assist for **US stocks and ETFs** that interfaces with
+thinkorswim and tells you what to do with **the stock you're currently looking
+at**.
 
 ---
 
-## 1. Platform reality check
+## 1. The central design problem
 
-thinkorswim has no API of its own. Since the TD Ameritrade migration, all
-programmatic access runs through the **Schwab Trader API**
-(`developer.schwab.com`), and every legacy TDA key has been sunset. Four
-constraints from that API drive most of the architecture below, so they belong
-at the top rather than buried in a phase.
+Everything else in this document follows from one constraint:
 
-**1. Futures can be analyzed but not traded.** Order entry accepts equity and
-option asset types only; a futures order returns `400 Unsupported instrument`.
-Futures market data *is* available — `LEVELONE_FUTURES` quotes and
-`CHART_FUTURES` minute bars — so /ES and /NQ work fine as regime context and as
-signal sources. But the one-click confirm path cannot include them. Futures
-recommendations are advisory: the engine tells you what it sees, you execute in
-thinkorswim by hand. Plan accordingly, or route futures through a broker with an
-order API (Tradovate, IBKR) later if hands-off futures matters.
+> **thinkorswim has no outbound API. It will not tell an external program which
+> symbol is on your screen.**
 
-**2. There is no options price history.** The price-history endpoint covers
-equities and ETFs only. Option chains come with live Greeks and IV, and
-`LEVELONE_OPTIONS` streams real-time quotes, but nothing gives you historical
-option bars. Consequences: you cannot backtest an options strategy on Schwab
-data. Three ways out, and Phase 1 should start doing the first one immediately
-regardless of which you pick:
+thinkScript is sandboxed — no HTTP, no file I/O, no IPC. So the platform cannot
+push its UI state anywhere. That leaves two fundamentally different shapes for
+this app, and the routes below are really variations on which one you pick:
 
-- Record your own tape from day one — every chain snapshot and streamed quote
-  you persist becomes backtestable history later. Cheap, but you wait months.
-- Trade options off *underlying* signals and model the option leg with
-  Black-Scholes using the observed IV surface. Backtestable now, approximate.
-- Buy vendor history (Polygon, Databento, CBOE DataShop). Fastest to rigor,
-  costs money.
+| | Where the verdict appears | Symbol context | Compute available |
+|---|---|---|---|
+| **On-chart** | Inside thinkorswim, as a study | **Free** — a study runs on whatever chart you open | Constrained to thinkScript |
+| **External** | Companion app / panel | **Must be bridged** — the hard part | Unlimited |
 
-**3. There is no paper-trading sandbox.** The API is live-only. Forward testing
-has to run through a `PaperBroker` you write yourself, filling against live
-streaming quotes with a modeled spread and slippage. This is not optional
-scaffolding — it is the only evidence you will have before risking capital, and
-it is what makes the "recommend + one-click" gate meaningful.
+The on-chart shape solves the "current stock" requirement perfectly and for
+nothing, because `GetSymbol()` is simply whatever you're viewing. The external
+shape gives you real backtesting, portfolio state, and any model you want, but
+you have to solve symbol detection.
 
-**4. Auth expires aggressively.** Access tokens last 30 minutes; the refresh
-token dies after **7 days, hard**, requiring an interactive browser login with
-2FA. For an intraday system this is the single largest operational risk: a token
-that dies at 10:15 AM takes your exit management with it. Section 6 covers the
-mitigation.
-
-Also worth knowing: rate limits run ~120 requests/minute (429-001 for rate,
-429-005 for burst, back off 60s), which is why streaming rather than polling is
-mandatory intraday. App registration requires a developer account separate from
-your brokerage login, and approval for the two products — *Market Data
-Production* and *Accounts and Trading Production* — takes days, so start it
-before you write any code.
+The best system uses both. That's the recommendation in §7.
 
 ---
 
-## 2. What the system actually does
+## 2. Route 1 — thinkScript-native, on-chart assist
 
-Four questions, answered continuously during the session:
+The verdict lives on the chart as a label: `BUY 72` / `HOLD 11` / `SELL −64`,
+recomputed on whatever symbol you open. No servers, no API keys, no auth, no
+data subscription. Real-time data is already included with your account.
 
-1. **What should I buy right now, and why?** Ranked candidates with entry zone,
-   stop, target, size, and a plain-language rationale.
-2. **What should I do with what I already hold?** Position-aware exits — current
-   R-multiple, distance to stop, whether the original thesis is still intact.
-   Most retail systems have a buy rule and no sell rule; this half is the one
-   that decides your P&L.
-3. **Should I be trading at all today?** A regime gate that can say "no."
-4. **What did that cost me?** Every recommendation logged and scored, so the
-   system's own hit rate is measurable rather than remembered.
+**Deliverables**
+- `score_study.ts` — composite score plotted as a label + signal arrows
+- `watchlist_column.ts` — score as a custom quote column across your universe
+  (20 custom-quote slots available; a custom-quote study must have exactly one plot)
+- `scan.ts` — Stock Hacker query to surface candidates
+- Study alerts → push/email when a symbol crosses into BUY or SELL
 
----
+**What it can't do — structural, not effort**
+- **No portfolio-level state.** thinkScript is bar-scoped and per-symbol. It
+  cannot read your account equity, total open risk, or count day trades. A real
+  risk layer (§6) is impossible here.
+- **No rigorous backtest.** `AddOrder` is chart-only and backtest-only. No
+  walk-forward, no purged splits, no cost-sensitivity curve.
+- **No external data** — no fundamentals, earnings dates, or news.
+- **Conditional orders are one-shot**, expire after firing, and reject complex
+  scripts. Semi-automation at best; thinkorswim does not support unattended
+  automated trading.
+- Studies are stored **on Schwab's servers, not local disk**. Version control
+  means manually exporting `.ts` files.
 
-## 3. Architecture
-
-```
-                    ┌──────────────────────────────────────┐
-                    │      Schwab Trader API               │
-                    │  REST: history, chains, accounts,    │
-                    │        orders, movers, market hours  │
-                    │  WS:   LEVELONE_{EQUITIES,OPTIONS,   │
-                    │        FUTURES}, CHART_{EQUITY,      │
-                    │        FUTURES}, ACCT_ACTIVITY       │
-                    └───────────────┬──────────────────────┘
-                                    │
-        ┌───────────────────────────┴────────────────────────┐
-        │                    ingest/                         │
-        │  token daemon · streamer client · REST client      │
-        │  bar builder (1m→5m→15m→1h) · corporate actions    │
-        └───────────────────────────┬────────────────────────┘
-                                    │
-                    ┌───────────────▼───────────────┐
-                    │   store/  DuckDB + Parquet    │
-                    │   bars · chains · ticks ·     │
-                    │   recommendations · fills     │
-                    └───────────────┬───────────────┘
-                                    │
-        ┌───────────────────────────▼────────────────────────┐
-        │                    signals/                        │
-        │  L0 regime gate → L1 features → L2 score → L3 exit │
-        └───────────────────────────┬────────────────────────┘
-                                    │
-        ┌───────────────────────────▼────────────────────────┐
-        │  risk/  sizing · daily loss limit · PDT · heat      │
-        └───────────────────────────┬────────────────────────┘
-                                    │
-        ┌─────────────┬─────────────┴──────────┬─────────────┐
-        │  dashboard  │   push (approve/deny)  │  thinkScript│
-        │  FastAPI    │   Pushover/Telegram    │  study+scan │
-        └─────────────┴─────────────┬──────────┘─────────────┘
-                                    │ user taps Approve
-                    ┌───────────────▼───────────────┐
-                    │  execution/  ticket → order   │
-                    │  kill switch · audit log      │
-                    └───────────────────────────────┘
-```
-
-### Suggested layout
-
-```
-investassist/
-  ingest/      auth.py streamer.py rest.py bars.py calendar.py
-  store/       schema.sql writer.py reader.py
-  signals/     regime.py features.py score.py exits.py
-               spec/*.yaml          # single source of truth for parameters
-  options/     chain.py select.py greeks.py
-  risk/        sizing.py limits.py pdt.py
-  execution/   ticket.py broker.py paper.py audit.py
-  api/         app.py routes/ ws.py
-  backtest/    engine.py costs.py walkforward.py metrics.py
-  thinkscript/ score_study.ts watchlist_column.ts scan.ts parity_export.ts
-  tests/
-```
-
-**Stack:** Python 3.12, `uv`, `schwab-py` (handles OAuth and the streamer),
-`httpx`, `polars` or `pandas`, DuckDB + Parquet, FastAPI, APScheduler,
-`pydantic-settings`, `structlog`, `pytest`. Frontend can stay boring — HTMX or a
-small React page. Deploy on a machine that is reliably up 9:30–16:00 ET; a $10
-VPS with systemd beats your laptop lid.
+**Effort: 3–7 days.** Highest value-per-hour of anything in this document, and
+it satisfies the "current stock" requirement on day one.
 
 ---
 
-## 4. Signal design
+## 3. Route 2 — RTD bridge: thinkorswim as the data source, Python as the brain
 
-Layered, so each piece is independently testable and independently
-falsifiable.
+thinkorswim ships an **RTD (Real-Time Data) COM server** on Windows — officially
+documented by Schwab, still current in 2026. A running TOS instance streams live
+quote data to any local program that asks. This is the integration surface most
+people don't know exists, and it sidesteps the entire Schwab API stack: **no
+OAuth, no developer app, no approval wait, no 7-day re-auth, no data bill.**
 
-### L0 — Regime gate (per session, re-evaluated every 15m)
+**How it works**
+- Python reads RTD over COM via `pywin32`. (`TOSDataBridge` wraps the older DDE
+  path with C/C++/Java/Python interfaces and a TCP layer for non-Windows
+  clients — useful reference implementation either way.)
+- Crucially, thinkorswim exports **custom RTD fields driven by thinkScript**, so
+  a value your on-chart study computes can be read directly by your Python
+  engine. That is a genuine two-way bridge and the thing that makes Routes 1 and
+  2 one system rather than two.
 
-Decides whether to trade at all and which *style* of rule applies. Inputs: /ES
-and /NQ trend and overnight range, VIX level and term structure, gap size vs
-ATR, opening-range width, index breadth. Output: `TREND_UP | TREND_DOWN |
-BALANCE | AVOID`. Mean-reversion rules fire only in `BALANCE`; breakout rules
-only in trend regimes; `AVOID` blocks new entries entirely (FOMC 2:00 PM, CPI
-open, halted-heavy tape). This gate is what stops a chop-day from
-death-by-a-thousand-stops.
+**Constraints**
+- Windows only; thinkorswim must be running and logged in.
+- Run one TOS instance and ideally one RTD consumer — Schwab's own docs warn
+  about multiple concurrent consumers.
+- It is a **quote stream, not a history API.** You specify symbols and receive
+  live fields. Historical bars must be recorded by you or sourced elsewhere.
+- It does not know your active chart symbol — that's Route 3.
 
-### L1 — Per-symbol features (1m / 5m / 15m)
-
-Computed on every completed bar: session VWAP with standard-deviation bands,
-anchored VWAP from open and from prior HOD/LOD, opening-range high/low, prior
-day H/L/C, EMA stack (9/21/50), ATR(14), RSI(2) and RSI(14), MACD, Donchian
-channels, and — the one people skip — **relative volume against a 20-day
-same-time-of-day profile**, because 500k shares at 9:45 and at 14:45 mean
-completely different things.
-
-### L2 — Composite score
-
-Rather than a binary crossover, emit a score in −100…+100 plus a confidence,
-mapped to `STRONG BUY / BUY / HOLD / TRIM / SELL / STRONG SELL`. Start
-**rule-based and transparent** — weighted contributions you can read off the
-dashboard — because an opaque score you don't trust is a score you'll override
-at exactly the wrong moment. Only after the rule version has a measured
-baseline should you consider a gradient-boosted classifier predicting
-`P(+1R before −1R within N bars)`, labeled with the triple-barrier method.
-
-### L3 — Exit engine
-
-Equal billing with entries. Every open position carries: initial stop
-(`entry − k×ATR` or structure-based, whichever is tighter), a chandelier
-trailing stop that activates at +1R, scale-out at +1R / +2R, a time stop
-(flatten by 15:50 ET), and a thesis-invalidation exit when the L2 score crosses
-back through zero. The dashboard shows all five distances at once for every
-position you hold.
-
-### Options layer
-
-Since there's no history to optimize against, contract selection is a
-**live-chain filter, not a model**: delta 0.55–0.70 for directional trades,
-DTE window matched to holding time (0–2 DTE intraday is a different risk
-animal — decide deliberately), minimum open interest and volume, maximum spread
-as a percentage of mid, and an IV-rank check so you're not buying premium into
-an earnings crush. Critically: **stops trigger off the underlying's price, not
-the option's** — option quotes gap and widen in ways that will stop you out on
-noise.
-
-### Futures layer
-
-Signals and context only, per §1. The engine emits the recommendation; you
-execute manually in thinkorswim.
+**Effort: 2–4 weeks.**
 
 ---
 
-## 5. Risk management
+## 4. Route 3 — The symbol-context bridge
 
-Non-negotiable, and cheaper to build now than to retrofit after a bad week:
+This is what turns Route 2 into "the stock I'm looking at." Ranked by
+robustness, and all of them are **read-only** — categorically different from
+UI-automating order entry, which remains a bad idea.
 
-- **Fixed-fractional sizing:** `shares = floor(equity × risk_pct / (entry − stop))`,
-  with `risk_pct` starting at 0.25–0.5% intraday.
-- **Daily loss limit:** at −2R on the day, the engine stops issuing buy tickets
-  and says so. This single rule prevents more damage than any indicator adds.
-- **PDT compliance:** under $25k equity you get 3 day trades per rolling 5
-  business days. The engine must count them and refuse to stage a ticket that
-  would breach it — an intraday system on a small account will hit this in week
-  one otherwise.
-- **Portfolio heat cap:** total open risk ≤ 2R; max concurrent positions ≤ 4.
-- **Correlation guard:** reject a 5th long when four are already in the same
-  sector or all beta-loaded to /ES.
+1. **Hotkey + clipboard** — you press a hotkey, the app reads the clipboard,
+   validates it against a ticker list, and scores it. Never breaks, works on any
+   layout, ~40 lines of code. **Build this first.** It covers the real workflow
+   more than it sounds like it does.
+2. **Clipboard watcher** — same thing, but polls continuously so the panel
+   follows along as you copy symbols. No hotkey needed.
+3. **Window title** — detached TOS chart windows often carry the symbol in the
+   title. Enumerate with `pywin32`. Free if true on your setup; a one-hour spike
+   settles it.
+4. **OCR of the symbol field** — screenshot a fixed region, run Tesseract. Short
+   uppercase tickers in a fixed font is near-best-case for OCR. Self-contained,
+   but breaks when you move panels.
+5. **Java Access Bridge** — thinkorswim is Java/Swing, and JAB exposes the
+   accessibility tree on Windows. The most "correct" approach and the flakiest
+   in practice.
 
----
-
-## 6. Auth resilience
-
-Given the 30-minute / 7-day token structure, treat auth as a first-class
-subsystem:
-
-- Background task refreshes the access token every ~25 minutes.
-- Token store on disk with restrictive permissions, never in the repo.
-- **Health monitor:** refresh token age > 5 days triggers a daily push
-  reminder; > 6.5 days triggers an hourly one. A failed refresh immediately
-  pushes an alert and flips the system to read-only rather than failing silent.
-- **Sunday re-auth ritual:** a `make reauth` target that spins up the local
-  callback listener on `https://127.0.0.1:8182`, opens the browser, and
-  completes the flow in under a minute. Automate everything except the login
-  and 2FA, which Schwab will always make you do by hand.
-- Degrade loudly: if data goes stale, the dashboard shows a banner and exit
-  management switches to "manual — check thinkorswim," because a silently
-  frozen exit engine is worse than no exit engine.
+Start at 1, treat 3 as a cheap spike, and only reach for 4–5 if the workflow
+genuinely demands hands-free.
 
 ---
 
-## 7. Validation — the part that decides whether any of this is worth running
+## 5. Routes 4 and 5 — the alternatives, briefly
 
-Build the backtest harness before you trust a single signal.
+**Route 4 — third-party data, TOS purely as your chart.** Python engine on
+Polygon (~$29–199/mo, full SIP), Databento (pay-as-you-go, excellent history),
+or Tiingo. Best analysis quality and backtest rigor, cleanest engineering, and
+the weakest "interfaces with thinkorswim" story — you look at TOS, you glance at
+the app. Symbol entry via Route 3.
 
-**Avoid lookahead:** decide on bar close, fill at next bar open, plus modeled
-slippage. **Model costs honestly** — equity commissions are ~0 but the spread
-isn't, and intraday it dominates. Produce a **cost-sensitivity curve** showing
-edge vs assumed slippage; if the strategy dies at half a cent of extra
-slippage, it was never real. **Walk-forward** with purged and embargoed splits,
-since intraday bars are heavily autocorrelated and a naive split leaks.
+**Route 5 — the Schwab Trader API.** Worth reconsidering now that scope is
+stocks-only, because that removes two of the three constraints that made it
+awkward before: equities have **full price history** (options don't), and equity
+**order entry is supported** (futures isn't), so a real one-click-confirm loop
+works. What remains is the 30-minute access token, the **hard 7-day refresh
+expiry** requiring interactive login with 2FA, ~120 req/min limits, and no paper
+sandbox. Add this when you want the app to place orders, not before.
 
-Metrics that matter: expectancy in R, profit factor, hit rate, average hold
-time, trades per day, max drawdown, Sharpe — and always benchmarked against
-buy-and-hold SPY. If it doesn't beat SPY after costs, the correct output of this
-project is "don't trade this," and that is a genuinely valuable result.
-
-**Multiple-testing discipline:** if you sweep 500 parameter combinations, the
-best one is almost certainly luck. Cap the search, and prefer a broad plateau of
-mediocre-but-stable parameters over a sharp peak.
-
-**Then forward paper-trade** through the `PaperBroker` against live streaming
-quotes for 4–8 weeks minimum before enabling one-click confirm. This is where
-most of the honest information comes from.
+**Considered and rejected: thinkorswim web + browser extension.** A browser
+extension would make symbol detection trivial — read it from the DOM. But **the
+web version does not support custom scripts or custom indicators at all**, so
+you'd forfeit the entire on-chart layer. Not worth it.
 
 ---
 
-## 8. Execution flow (recommend + one-click confirm)
+## 6. What the engine computes (Routes 2–5)
 
-1. Signal fires → engine builds an `OrderTicket` (validated, priced, sized).
-2. Pre-trade checks: buying power, PDT count, daily loss limit, position not
-   already open, symbol not halted, spread within tolerance, data fresh.
-3. Ticket surfaces on the dashboard and as a push notification with Approve /
-   Deny.
-4. **Ticket TTL of 60–90 seconds**, then auto-expire and re-price. Intraday, a
-   stale ticket is a bad fill.
-5. On approve → `POST /accounts/{hash}/orders` with an idempotency key and a
-   duplicate-submit guard.
-6. Track the fill via the `ACCT_ACTIVITY` stream; hand the position to the exit
-   engine.
-7. Everything — proposed, approved, denied, expired, filled — lands in an audit
-   table.
+Layered so each piece is independently testable.
 
-**Kill switch:** one dashboard button and one flag file, either of which blocks
-all submissions immediately. Test it before you need it.
+**L0 — Regime gate.** Is this a tape worth trading? SPY vs its 200-day, VIX
+level, breadth. In thinkScript this is reachable via `close("SPY")` references.
+Output gates everything downstream.
 
----
+**L1 — Features.** Trend (EMA stack, ADX, Donchian), momentum (RSI, ROC, MACD),
+mean-reversion (Bollinger z-score, RSI(2)), volatility (ATR, realized vol),
+volume (relative volume vs a 20-day profile, OBV), and location (distance to
+52-week high, prior-day levels, VWAP).
 
-## 9. thinkScript mirror
+**L2 — Composite score,** −100…+100 plus a confidence, mapped to
+`STRONG BUY / BUY / HOLD / TRIM / SELL / STRONG SELL`. Keep it **rule-based and
+transparent** — weighted contributions you can read off the panel — because an
+opaque score is one you'll override at exactly the wrong moment. ML only after
+the rule version has a measured baseline.
 
-The Python engine is the brain; thinkScript makes it visible where you already
-look. Build four artifacts:
+**L3 — Exit logic, with equal billing.** Most retail systems have a buy rule and
+no sell rule, and "should I sell this" is half your question. Every position
+carries an initial stop (`entry − k×ATR` or structure), a trailing stop that
+activates at +1R, scale-out levels, a time stop, and a thesis-invalidation exit
+when L2 crosses back through zero.
 
-- **`score_study.ts`** — plots the L2 score and signal arrows on your charts.
-- **`watchlist_column.ts`** — score as a custom quote column (note: thinkorswim
-  allows 20 custom quote slots, and a custom-quote study must have exactly one
-  plot).
-- **`scan.ts`** — Stock Hacker query producing the candidate universe.
-- **Study alerts** as an independent backstop, so a signal still reaches you if
-  the Python service is down.
+**Risk layer** (external routes only): fixed-fractional sizing
+`shares = floor(equity × risk_pct / (entry − stop))`, a daily loss limit, PDT
+day-trade counting if under $25k, a portfolio heat cap, and a correlation guard.
 
-**Keep them honest with a parity test.** Put every parameter in
-`signals/spec/*.yaml`, generate the thinkScript constants from it, export a
-sample day's study values from thinkorswim, and assert they match the Python
-output within tolerance in CI. Two implementations that silently drift are worse
-than one. Known thinkScript limits to design around: no HTTP or external data,
-no cross-session persistence, no portfolio-level state, and repaint risk on
-secondary aggregations.
+**Validation.** Decide on bar close, fill at next bar open, model slippage, and
+produce a cost-sensitivity curve — if the edge dies at half a cent of extra
+slippage it was never there. Walk-forward with purged splits. Benchmark against
+buy-and-hold SPY; if it doesn't win after costs, "don't trade this" is the
+correct and valuable output.
 
 ---
 
-## 10. Phasing
+## 7. Recommended path
 
-| Phase | Work | Est. |
-|---|---|---|
-| 0 | Developer account, register app for both products, wait for approval, OAuth + token daemon working, read positions | Week 1 |
-| 1 | Data layer: REST backfill, streamer ingest, bar builder, market calendar, **start recording option chains immediately** | Week 2 |
-| 2 | Feature library + L0/L1/L2, recommend-only output to console/CSV | Weeks 3–4 |
-| 3 | Backtest harness, walk-forward, cost sensitivity → **go/no-go on the signal** | Weeks 5–6 |
-| 4 | Risk manager + L3 exit engine + position-aware "what do I hold" report | Week 7 |
-| 5 | Dashboard, push notifications, ticket lifecycle, `PaperBroker` forward test begins | Week 8 |
-| 6 | Paper forward test running; build thinkScript mirror + parity test; options chain selector | Weeks 9–16 |
-| 7 | Enable one-click confirm — smallest size, daily loss limit on, kill switch tested | Week 17+ |
+**Phase 1 — Route 1, one week.** Build the thinkScript study, watchlist column,
+scan, and alerts. You immediately get an on-chart verdict for whatever symbol
+you're viewing, with zero infrastructure. This alone may be most of what you
+wanted.
 
-First genuinely useful output — a ranked recommend-only list — lands around week
-4. A one-click system you have real evidence for is a ~4-month project of
-evenings. Phase 3 is a real gate, not a formality: if the numbers don't clear
-costs, stop there.
+**Phase 2 — Route 3 item 1, one day.** Hotkey + clipboard, plus a minimal
+always-on-top panel. Now you have somewhere to put analysis thinkScript can't do.
+
+**Phase 3 — Route 2, two to four weeks.** RTD bridge feeding a Python engine.
+Record everything from day one — that recorded tape becomes your backtest data.
+Port L1/L2 to Python and add what thinkScript can't reach: fundamentals,
+earnings proximity, sector relative strength, portfolio state.
+
+**Phase 4 — validation.** Backtest harness, walk-forward, cost sensitivity. This
+is a real go/no-go gate on whether the scoring model is worth trusting.
+
+**Phase 5 — Route 5, optional.** Add the Schwab API when you want one-click
+order placement rather than recommendations.
+
+Keep the two implementations honest with a **parity test**: put every parameter
+in `signals/spec/*.yaml`, generate the thinkScript constants from it, export a
+day of study values from TOS, and assert they match the Python output within
+tolerance. Two implementations that silently drift are worse than one.
 
 ---
 
-## 11. Things worth knowing before you start
+## 8. Worth knowing
 
-Intraday retail edge is genuinely hard, and transaction costs eat most published
-indicator combinations. The value of building this properly is that it *measures*
-whether your ideas work instead of leaving it to memory, which reliably flatters
-past decisions. The backtest harness in Phase 3 is the most valuable component in
-the repo, not the signal.
+RTD's officially-supported status is the quiet win here — it gives you a
+sanctioned local integration with thinkorswim that needs no credentials and no
+approval, and it is the reason Routes 1 and 2 compose into a single system
+instead of two disconnected ones.
 
-If you add an LLM layer to write the "why" narrative, the numbers must come from
+If you add an LLM to write the "why" narrative, the numbers must come from
 deterministic code and the model may only phrase them. A model that invents a
 price level is a liability.
 
-Two boundaries to keep in view: this is a personal decision-support tool, and
-distributing recommendations to others moves you toward investment-adviser
-territory with real registration implications. Separately, Schwab's market-data
-agreement restricts redistribution — keep the data to yourself. Neither is legal
-advice; both are worth five minutes of reading before the project grows an
-audience.
+Two boundaries: this is a personal decision-support tool, and distributing
+recommendations to others moves toward investment-adviser territory with real
+registration implications. Schwab's market-data agreement also restricts
+redistribution — keep the data to yourself. Neither is legal advice; both are
+worth five minutes before the project grows an audience.
 
 ---
 
 ## Sources
 
-- [Does thinkorswim Have an API? — Schwab Migration Guide](https://www.aurascience.blog/does-thinkorswim-have-an-api)
-- [The (Unofficial) Guide to Charles Schwab's Trader APIs](https://medium.com/@carstensavage/the-unofficial-guide-to-charles-schwabs-trader-apis-14c1f5bc1d57)
-- [Schwab Trader API overview](https://grokipedia.com/page/Schwab_Trader_API)
-- [schwab-py — Authentication](https://schwab-py.readthedocs.io/en/latest/auth.html) · [HTTP Client](https://schwab-py.readthedocs.io/en/latest/client.html) · [Streaming Client](https://schwab-py.readthedocs.io/en/latest/streaming.html)
-- [Lumibot — Schwab broker notes](https://lumibot.lumiwealth.com/brokers.schwab.html)
-- [Schwab API for Traders: Costs and Real Limits](https://mylinedchart.com/resources/articles/schwab-api-for-technical-traders-workflow-fit-checklist)
-- [thinkScript reference](https://toslc.thinkorswim.com/center/reference/thinkScript) · [Study Alerts](https://toslc.thinkorswim.com/center/howToTos/thinkManual/MarketWatch/Alerts/studyalerts) · [thinkScript in Conditional Orders](https://toslc.thinkorswim.com/center/howToTos/thinkManual/Trade/Order-Entry-Tools/Order-Types/thinkScript-in-Conditional-Orders) · [Custom Quotes](https://toslc.thinkorswim.com/center/howToTos/thinkManual/MarketWatch/Quotes/customquotes)
+- [Real-Time Data (RTD) Function for thinkorswim — Schwab](https://toslc.thinkorswim.com/center/howToTos/thinkManual/Miscellaneous/Real-Time-Data-%28RTD%29-Function-for-thinkorswim.html) · [RTD setup guide](https://marketxls.com/blog/thinkorswim-rtd-excel) · [Hahn-Tech RTD notes](https://www.hahn-tech.com/thinkorswim-thinkorswim-rtd-excel/)
+- [TOSDataBridge — DDE/RTD extraction, C/C++/Java/Python](https://github.com/jeog/TOSDataBridge)
+- [thinkScript reference](https://toslc.thinkorswim.com/center/reference/thinkScript) · [Study Alerts](https://toslc.thinkorswim.com/center/howToTos/thinkManual/MarketWatch/Alerts/studyalerts) · [Custom Quotes](https://toslc.thinkorswim.com/center/howToTos/thinkManual/MarketWatch/Quotes/customquotes) · [thinkScript in Conditional Orders](https://toslc.thinkorswim.com/center/howToTos/thinkManual/Trade/Order-Entry-Tools/Order-Types/thinkScript-in-Conditional-Orders)
+- [ThinkorSwim Web vs. Desktop](https://thinkscript101.com/thinkorswim-web-vs-desktop/) — custom scripts unsupported on web
+- [Java Access Bridge overview](https://docs.oracle.com/en/java/javase/20/access/java-access-bridge-overview.html)
+- [schwab-py docs](https://schwab-py.readthedocs.io/en/latest/auth.html) · [Schwab Trader API overview](https://grokipedia.com/page/Schwab_Trader_API)
