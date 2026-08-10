@@ -4,6 +4,15 @@ A buy/sell decision assist for **US stocks and ETFs** that interfaces with
 thinkorswim and tells you what to do with **the stock you're currently looking
 at**.
 
+> **Status.** The recommended sequence in §7 is implemented — see
+> [README.md](README.md) for setup and usage. Route 1 (the three thinkScript
+> studies), Route 3 item 1 (clipboard watcher + hotkey + panel), Route 2 (the
+> RTD bridge and recorder) and the validation harness are all in the repo with
+> 104 passing tests. Route 5 (the Schwab API, for order placement) is
+> deliberately not built: it should wait until the backtest says the signal is
+> worth trading. The one component that still needs a verification pass is the
+> RTD COM path, which cannot be exercised off Windows.
+
 ---
 
 ## 1. The central design problem

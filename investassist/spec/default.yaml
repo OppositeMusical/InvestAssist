@@ -1,0 +1,110 @@
+# InvestAssist scoring specification.
+#
+# This file is the single source of truth for every tunable in the system.
+# The Python engine loads it directly; the thinkScript studies get their
+# constants generated from it by `python -m investassist.cli gen-thinkscript`.
+# Changing a number here and regenerating keeps both implementations in step —
+# see tools/parity.py for the test that proves they still agree.
+
+name: default
+version: 1
+
+# ---------------------------------------------------------------------------
+# L0 — Regime gate. Answers "is this a tape worth buying into at all?"
+# Evaluated on the benchmark, not the symbol under analysis.
+# ---------------------------------------------------------------------------
+regime:
+  benchmark: SPY
+  trend_lookback: 200      # benchmark above/below this SMA
+  roc_lookback: 20         # benchmark rate-of-change window
+  # Regime multipliers applied to the final long score. Risk-off does not
+  # flip the sign, it damps conviction — the symbol may still be strong.
+  risk_on_multiplier: 1.0
+  neutral_multiplier: 0.85
+  risk_off_multiplier: 0.55
+
+# ---------------------------------------------------------------------------
+# L1 — Feature parameters. Every indicator here has a native thinkScript
+# equivalent; that constraint is deliberate and keeps parity achievable.
+# ---------------------------------------------------------------------------
+features:
+  ema_fast: 20
+  ema_mid: 50
+  ema_slow: 200
+  adx_length: 14
+  adx_trend_floor: 20      # below this, trend components are damped
+  rsi_length: 14
+  rsi_fast_length: 2       # mean-reversion leg
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  bb_length: 20
+  bb_stdev: 2.0
+  atr_length: 14
+  donchian_length: 252     # ~52 weeks, for distance-to-high
+  volume_avg_length: 20
+  min_bars: 260            # refuse to score with less history than this
+
+# ---------------------------------------------------------------------------
+# L2 — Composite score. Each component returns -100..+100; the score is the
+# weighted mean, then damped by regime. Weights need not sum to 1 (they are
+# normalised at runtime) but keeping them tidy makes the panel readable.
+# ---------------------------------------------------------------------------
+weights:
+  trend_stack: 0.22        # EMA alignment, the backbone
+  trend_strength: 0.10     # ADX-gated confirmation
+  momentum: 0.18           # MACD histogram
+  rsi_position: 0.12       # regime-conditional: momentum in trend, MR in range
+  mean_reversion: 0.14     # Bollinger %B
+  location: 0.12           # distance from 52-week high
+  volume: 0.12             # relative volume confirmation
+
+# Confidence is reported alongside the score. It is NOT part of the score.
+confidence:
+  # Fraction of weight whose components agree in sign with the final score.
+  agreement_weight: 0.7
+  # Penalty when realised volatility is extreme (score is less reliable).
+  volatility_weight: 0.3
+  high_atr_pct: 6.0        # ATR as % of price above which we discount hard
+
+# ---------------------------------------------------------------------------
+# Verdict thresholds. Symmetric by design.
+# ---------------------------------------------------------------------------
+verdicts:
+  strong_buy: 60
+  buy: 25
+  trim: -25
+  sell: -60
+
+# ---------------------------------------------------------------------------
+# L3 — Exit levels. Computed for any open or proposed position.
+# ---------------------------------------------------------------------------
+exits:
+  initial_stop_atr: 2.0        # entry - k * ATR
+  trail_activate_r: 1.0        # trailing stop engages at +1R
+  chandelier_lookback: 22
+  chandelier_atr: 3.0
+  targets_r: [1.0, 2.0]        # scale-out levels in R multiples
+  time_stop_bars: 40           # flatten if thesis hasn't worked by here
+  invalidate_below: 0          # exit when score crosses back under this
+
+# ---------------------------------------------------------------------------
+# Risk. Applies to the external engine only — thinkScript cannot see account
+# state, so none of this exists in the on-chart implementation.
+# ---------------------------------------------------------------------------
+risk:
+  risk_pct: 0.005              # 0.5% of equity risked per position
+  max_position_pct: 0.20       # no single name above 20% of equity
+  max_open_positions: 8
+  max_portfolio_heat_r: 4.0    # total open risk, in R
+  daily_loss_limit_r: 2.0      # halt new entries for the day past this
+
+# ---------------------------------------------------------------------------
+# Backtest cost model. Slippage is the assumption most likely to be wrong,
+# which is why the harness sweeps it rather than trusting one value.
+# ---------------------------------------------------------------------------
+costs:
+  commission_per_share: 0.0
+  commission_min: 0.0
+  slippage_bps: 5.0            # 5 bps each way on the fill
+  slippage_sweep_bps: [0.0, 2.5, 5.0, 10.0, 20.0, 40.0]

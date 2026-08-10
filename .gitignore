@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local bar cache, recorded RTD sessions and thinkorswim exports. All of it is
+# reproducible or re-recordable, and none of it belongs in git.
+recorded/
+exports/
+data/
+*.parquet
+
+.DS_Store
+.idea/
+.vscode/
