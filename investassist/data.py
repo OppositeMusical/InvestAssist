@@ -96,15 +96,27 @@ class CSVProvider(HistoryProvider):
 
 
 class StooqProvider(HistoryProvider):
-    """Free daily bars from stooq.com. No API key, no account, rate-limited.
+    """Free daily bars from stooq.com. No API key, no account.
 
-    Good enough to get the engine running today. Note that stooq adjusts for
-    splits but its dividend handling is inconsistent, so treat it as a
-    development source rather than the basis for a live allocation decision.
+    .. warning::
+       Stooq is **not reliable** as of August 2026 and is kept only as a
+       fallback. It rejects the default ``requests`` user agent with a 404,
+       and even with a browser user agent it serves an HTML page rather than
+       the CSV download — so it is bot-blocked rather than merely rate
+       limited. Use :class:`YFinanceProvider` or :class:`CSVProvider` instead.
+
+    Note also that stooq adjusts for splits but handles dividends
+    inconsistently, so it was never the right basis for a live allocation
+    decision even when it worked.
     """
 
     name = "stooq"
     URL = "https://stooq.com/q/d/l/"
+    # Stooq 404s the default requests user agent outright.
+    USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+    )
 
     def fetch(self, symbol: str, start: date, end: date) -> pd.DataFrame:
         try:
@@ -118,12 +130,18 @@ class StooqProvider(HistoryProvider):
             "d2": end.strftime("%Y%m%d"),
             "i": "d",
         }
-        response = requests.get(self.URL, params=params, timeout=30)
+        response = requests.get(
+            self.URL, params=params, headers={"User-Agent": self.USER_AGENT}, timeout=30
+        )
         response.raise_for_status()
         text = response.text
-        # Stooq answers a bad symbol with a 200 and the body "No data".
+        # A bad symbol, a bot block or a rate limit all come back as HTML with
+        # a 200. Only a real download starts with the CSV header.
         if not text.lstrip().lower().startswith("date"):
-            raise ProviderError(f"{symbol}: stooq returned no data")
+            raise ProviderError(
+                f"{symbol}: stooq returned a page instead of CSV — it is likely "
+                "bot-blocking this request. Use --provider yfinance instead."
+            )
         return normalise(pd.read_csv(io.StringIO(text), index_col=0, parse_dates=True), symbol)
 
 

@@ -167,7 +167,7 @@ class Spec:
         path = Path(path) if path else DEFAULT_SPEC
         if not path.exists():
             raise SpecError(f"spec file not found: {path}")
-        raw = yaml.safe_load(path.read_text()) or {}
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         return cls.from_dict(raw)
 
     @classmethod

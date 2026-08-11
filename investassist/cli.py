@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from datetime import date
 from pathlib import Path
 
 from .data import BarStore, ProviderError, build_provider
@@ -17,7 +16,9 @@ REPO_THINKSCRIPT = Path(__file__).resolve().parent.parent / "thinkscript"
 
 
 def _add_data_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--provider", default="stooq", help="csv, stooq or yfinance")
+    parser.add_argument(
+        "--provider", default="yfinance", help="yfinance, csv or stooq (stooq is unreliable)"
+    )
     parser.add_argument("--csv-dir", help="directory of <SYMBOL>.csv files, for --provider csv")
     parser.add_argument("--spec", help="path to a spec YAML (defaults to the bundled one)")
     parser.add_argument("--cache", help="bar cache directory")
@@ -72,7 +73,7 @@ def cmd_scan(args) -> int:
     if args.file:
         symbols += [
             line.strip().upper()
-            for line in Path(args.file).read_text().splitlines()
+            for line in Path(args.file).read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.startswith("#")
         ]
     if not symbols:
@@ -115,7 +116,7 @@ def cmd_backtest(args) -> int:
     if args.file:
         symbols += [
             line.strip().upper()
-            for line in Path(args.file).read_text().splitlines()
+            for line in Path(args.file).read_text(encoding="utf-8").splitlines()
             if line.strip() and not line.startswith("#")
         ]
     if not symbols:

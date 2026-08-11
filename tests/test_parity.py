@@ -32,7 +32,7 @@ THINKSCRIPT_DIR = Path(__file__).resolve().parent.parent / "thinkscript"
 
 
 def core_of(path: Path) -> str:
-    text = path.read_text()
+    text = path.read_text(encoding="utf-8")
     start = text.index(BEGIN) + len(BEGIN)
     return text[start : text.index(END)].strip()
 
@@ -59,13 +59,15 @@ def test_all_three_studies_share_one_core():
 def test_generation_is_idempotent(tmp_path):
     spec = Spec.load()
     for name in TARGETS:
-        (tmp_path / name).write_text(f"{BEGIN}\nstale\n{END}\ntrailing content\n")
+        (tmp_path / name).write_text(
+            f"{BEGIN}\nstale\n{END}\ntrailing content\n", encoding="utf-8"
+        )
 
     assert set(generate(spec, tmp_path)) == set(TARGETS)
     # Second run has nothing left to change.
     assert generate(spec, tmp_path) == []
     # And the hand-written region below the markers is untouched.
-    assert (tmp_path / TARGETS[0]).read_text().endswith("trailing content\n")
+    assert (tmp_path / TARGETS[0]).read_text(encoding="utf-8").endswith("trailing content\n")
 
 
 def test_constants_carry_the_spec_values():
@@ -117,7 +119,7 @@ def test_spec_change_propagates(tmp_path):
 
 def test_missing_markers_are_an_error(tmp_path):
     broken = tmp_path / "broken.ts"
-    broken.write_text("no markers here")
+    broken.write_text("no markers here", encoding="utf-8")
     with pytest.raises(GeneratorError, match="markers"):
         render_into(broken, "core")
 

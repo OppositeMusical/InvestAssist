@@ -200,7 +200,9 @@ def render_into(path: Path, core: str) -> bool:
     if not path.exists():
         raise GeneratorError(f"missing thinkScript file: {path}")
 
-    text = path.read_text()
+    # Explicit UTF-8 both ways: the markers contain an em dash, and Windows
+    # would otherwise decode these files as cp1252 and never find them.
+    text = path.read_text(encoding="utf-8")
     start = text.find(BEGIN)
     stop = text.find(END)
     if start == -1 or stop == -1:
@@ -211,7 +213,7 @@ def render_into(path: Path, core: str) -> bool:
     updated = text[: start + len(BEGIN)] + "\n" + core + "\n" + text[stop:]
     if updated == text:
         return False
-    path.write_text(updated)
+    path.write_text(updated, encoding="utf-8")
     return True
 
 

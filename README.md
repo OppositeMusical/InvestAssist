@@ -58,8 +58,12 @@ investassist panel --equity 100000
 investassist backtest --file universe.txt --sweep
 ```
 
-Default history comes from stooq (free, no key). Use `--provider yfinance` or
-`--provider csv --csv-dir ./data` for anything else.
+Default history comes from **yfinance** (free, no key, split/dividend
+adjusted). Use `--provider csv --csv-dir ./data` to feed it your own exports.
+
+`--provider stooq` exists but is bot-blocked as of August 2026 — it 404s the
+default user agent and serves HTML instead of CSV even with a browser one.
+Kept only as a fallback in case that changes.
 
 ---
 

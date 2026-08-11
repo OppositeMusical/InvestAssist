@@ -13,7 +13,7 @@ from investassist.spec import COMPONENTS, DEFAULT_SPEC, Spec, SpecError
 
 
 def base_dict() -> dict:
-    return yaml.safe_load(DEFAULT_SPEC.read_text())
+    return yaml.safe_load(DEFAULT_SPEC.read_text(encoding="utf-8"))
 
 
 def test_default_spec_loads():
